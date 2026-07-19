@@ -260,3 +260,59 @@ buildpack auto-detection for frontend) and deploys to Cloud Run
 Two live public URLs — frontend is "the site," backend is the API
 it calls from the visitor's own browser
 ```
+
+---
+
+# Learning log — Day 3
+
+## 13. File-based routing (Next.js App Router)
+
+**Core idea:** the folder structure under `app/` directly becomes the URL structure —
+there's no separate routing config to maintain. Creating `app/resume/page.tsx`
+automatically makes `/resume` a real route.
+
+**What each special filename means:**
+| File | Role |
+|---|---|
+| `page.tsx` | the actual content shown at that route |
+| `layout.tsx` | a wrapping shell — can exist at the root (applies everywhere) or inside any route folder (applies to just that section and its children) |
+
+We're only using the root `layout.tsx` so far (the shared nav), but any section
+could get its own nested `layout.tsx` later if it needed distinct chrome the
+others don't.
+
+## 14. Component composition (small reusable pieces inside one page)
+
+`page.tsx` isn't one big blob of markup — it defines small local components
+(`SectionTitle`, `Check`) and reuses them repeatedly. This is the same "component"
+idea from Day 1's counter demo, just applied at a smaller scale: instead of
+writing `<h2 className="...">Skills</h2>` and `<h2 className="...">Experience</h2>`
+separately, `<SectionTitle>Skills</SectionTitle>` guarantees every section heading
+looks identical and only needs updating in one place.
+
+**Data-driven rendering:** the resume content itself lives in plain JS arrays/objects
+(`SKILLS`, `EXPERIENCE`) at the top of the file, and the JSX below just `.map()`s
+over them. This separates *content* from *layout* — editing a bullet point means
+editing data, not markup.
+
+## 15. Design tokens — the payoff of naming colors instead of hardcoding them
+
+**What we did:** rather than writing `bg-[#EDF0EA]` directly in the page, we defined
+named tokens (`canvas`, `ink`, `sage`, `mint`, `mint-soft`, `hairline`) once in
+`tailwind.config.js`, and every component references the *names*.
+
+**Why it mattered today, concretely:** switching the entire site's theme from warm
+charcoal to soft sage took editing exactly one file (`tailwind.config.js`) — zero
+changes to `layout.tsx` or `resume/page.tsx`, because they never referenced a raw
+color, only a token name. This is the general principle behind design systems in
+real products: indirection now (name it once) saves rework later (swap the
+definition, not every usage).
+
+## Recurring bug pattern, now confirmed twice
+
+Both `layout.tsx` (Day 1) and `resume/page.tsx` (Day 3) hit the identical failure:
+a copy-pasted JSX block silently lost its opening `<a` tag, and the compiler
+reported the error several lines away from the actual problem. Worth trusting this
+pattern going forward: if a build error mentions `Unexpected token` on a line that
+looks completely normal, check nearby `href=`/attribute lines for a tag missing
+its name — `grep -n 'href='` is a fast way to scan for it before even opening the browser.
