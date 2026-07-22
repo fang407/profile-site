@@ -100,6 +100,148 @@ since there's no agent logic yet to test.
 
 ---
 
+## 2026-07-24 — Day 5-6: RAG pipeline, from embeddings to a working chat agent
+
+**What happened:**
+Built the full retrieval-augmented generation pipeline: chunked and embedded
+resume content into Chroma (Day 5), then wrote the retrieval function, system
+prompt, chat logic, and a `/api/chat` FastAPI endpoint that ties them together
+with Gemini as the answering model (Day 6). Ended with a working, boundary-tested
+chat agent — confirmed to answer resume questions correctly and to decline
+off-topic ones per its system prompt.
+
+**What I decided / how I fixed it:**
+
+*Content structure, corrected mid-session:*
+- Chunk IDs should describe *purpose* (`internship_experience`), not just
+  *contents* (`dyson_panasonic`) — caught and renamed.
+- A genuine content error was caught: the TikTok Spot Bonus had been
+  miscategorized under `education` instead of `awards`. Fixed by splitting
+  academic facts and recognition into separate chunks — a deliberate choice,
+  not just a bug fix, since the two are different question types.
+
+*Two separate model-availability failures, same underlying lesson:*
+- `models/text-embedding-004` — deprecated by Google since these instructions
+  were written; fixed by switching to `models/gemini-embedding-001`.
+- `models/gemini-2.0-flash` — listed as an available model via `list_models()`,
+  but had zero free-tier quota specifically for that version. Learned that
+  "permitted to call" and "has non-zero free quota" are separate gates; fixed
+  by switching to the `-latest` alias (`gemini-flash-latest`) instead of a
+  pinned version, since Google maintains these aliases to track whichever
+  model currently sits in the free tier — more durable against future
+  quota reshuffling than a hardcoded version number.
+
+*Gemini billing, a real tangle worth naming honestly:*
+- Discovered Google Cloud Billing (the GCP trial) and Gemini API/AI Studio
+  billing are entirely separate systems — the GCP trial credit does not fund
+  Gemini API calls at all.
+- Hit a "prepayment credits are depleted" error on a fresh key; verified via
+  current forum reports that this is a known, currently-open Google-side
+  billing-sync bug specific to projects with an active GCP trial attached —
+  not something caused locally, and not reliably fixed by enabling billing.
+  Resolved by switching to a different, older API key/project with no GCP
+  trial attached.
+- **Net result: the resume agent's Gemini calls now run under a different
+  Google project than the Cloud Run infrastructure.** Deliberately left as-is
+  for now — functional and free, just not tidy — flagged for a possible later
+  cleanup (e.g. consolidating onto Vertex AI) rather than solved today.
+
+*Architecture decision made explicit, not just implemented:*
+- Named the distinction between what was built (a fixed pipeline — retrieval
+  runs unconditionally, hardcoded) and a true "agent" (LLM decides whether/
+  which tool to call, via function calling). Today's build is the former,
+  correctly and deliberately — autonomous tool-calling is planned for a later
+  day, not an oversight.
+
+*Error handling added:*
+- Endpoint now catches `ResourceExhausted` specifically (honest "try again"
+  message for rate limits) and generic `Exception` as a fallback (vague,
+  safe message — avoids leaking internals), logging the real error
+  server-side either way rather than surfacing raw tracebacks to visitors.
+
+**Known gap, deliberately deferred:**
+Chroma's `PersistentClient` writes to local disk, which will not survive Cloud
+Run's stateless container lifecycle (fresh filesystem on every restart/scale
+event). Works fine locally; not yet fixed for deployment. Flagged now so it's
+addressed as a planned step, not a surprise later.
+
+**Why / what I'd do differently:**
+Two separate "the model name I was given turned out to be stale" incidents in
+one session is a real pattern worth remembering going forward: AI provider
+APIs move fast enough that even confident-sounding instructions (mine
+included) can be wrong by the time they're acted on — verifying against the
+provider's current live behavior (a `list_models()` call, or a fresh search)
+before trusting a hardcoded model name is now a standing habit, not a one-off
+fix. Also worth remembering: distinguish "agent" from "fixed pipeline"
+precisely rather than loosely — it changed how the next few days' scope
+should be talked about and planned.
+
+## 2026-07-22 — Day 5-6: RAG pipeline, three separate Google-side surprises, and a working chat endpoint
+
+**What happened:**
+Built the full retrieval-augmented generation pipeline: chunked resume content,
+embedded and stored it in Chroma, wrote a system prompt, and wired retrieval +
+generation together behind a real `/api/chat` FastAPI endpoint. Ended the
+session with a working, grounded answer to a real question and a correctly
+enforced off-topic refusal. Most of the friction today was Google's Gemini
+API/billing landscape shifting under us mid-session, not application logic.
+
+**What I decided / how I fixed it:**
+
+*Deprecated embedding model:*
+- `models/text-embedding-004` (the model name first used) turned out to
+  already be deprecated by Google. Switched to `models/gemini-embedding-001`.
+  A follow-up edit then introduced a typo (`text-embedding-001`, a name
+  neither of us intended) — fixed by rewriting the line via `sed` directly in
+  the terminal rather than trusting another manual editor edit.
+
+*Two separate Google billing systems, tangled together:*
+- Google Cloud Billing (the GCP trial credit funding Cloud Run) and Gemini
+  API/AI Studio billing are entirely independent ledgers. An error reading
+  "prepayment credits are depleted" turned out to be a known, currently-
+  reported bug specific to Gemini API keys tied to a project that also has an
+  active GCP trial. Fixed by switching to a plain "Free tier" API key with no
+  GCP trial attached (a different, older personal project). Net effect: the
+  Gemini calls for this project now run under a different Google project than
+  the Cloud Run services — a bit tangled, flagged as something to potentially
+  clean up later, not urgent.
+
+*Per-model free-tier quota, independent of account-level status:*
+- Even the working key hit a second, different error: `gemini-2.0-flash`
+  specifically had a free-tier quota of 0, despite `list_models()` confirming
+  the key had permission to call it. Switched to `models/gemini-flash-latest`
+  — an alias Google keeps pointed at whichever model currently sits in the
+  free tier, more durable than pinning an exact version.
+
+*Missing error handling, surfaced by the quota error itself:*
+- The quota exception initially surfaced to `curl` as a generic
+  "500 Internal Server Error" with no useful detail, because `/api/chat` had
+  no exception handling at all. Added a `try/except` in the endpoint:
+  catching `ResourceExhausted` specifically for a clear "try again" message,
+  and a broader `except Exception` as a safety net with a generic message —
+  both logged in full server-side, neither ever shown raw to a visitor.
+
+**Result:** working end-to-end RAG chat, verified against both a real resume
+question (correctly grounded, cited real tools/projects) and an off-topic
+question (correctly declined and redirected).
+
+**Why / what I'd do differently:**
+Three of today's four blockers were Google's Gemini ecosystem changing
+underneath fixed instructions (deprecated model, billing-tier bug, zeroed
+per-model quota) — a good reminder that "AI moves fast" is true of the
+tooling and APIs themselves, not just model capabilities. Worth defaulting to
+checking `list_models()` or current docs directly rather than trusting a
+specific model name on faith, even from a source that sounds confident.
+
+Also a good, concrete lesson on system design: the missing error handling
+wasn't caught by writing the happy path carefully — it was caught by an
+actual failure occurring naturally during testing. Worth remembering that
+error-handling gaps are often invisible until something real breaks, which is
+itself a decent argument for testing failure paths deliberately rather than
+only ever testing the case expected to succeed.
+
+---
+
 <!-- New entries go above this line. Suggested template:
 
 ## YYYY-MM-DD — <short title>

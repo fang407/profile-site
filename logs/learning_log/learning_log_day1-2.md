@@ -310,9 +310,575 @@ definition, not every usage).
 
 ## Recurring bug pattern, now confirmed twice
 
-Both `layout.tsx` (Day 1) and `resume/page.tsx` (Day 3) hit the identical failure:
-a copy-pasted JSX block silently lost its opening `<a` tag, and the compiler
-reported the error several lines away from the actual problem. Worth trusting this
-pattern going forward: if a build error mentions `Unexpected token` on a line that
-looks completely normal, check nearby `href=`/attribute lines for a tag missing
-its name — `grep -n 'href='` is a fast way to scan for it before even opening the browser.
+Both "Unexpected token" build errors (Day 1 and Day 3) trace to an identical
+failure: a copy-pasted JSX block silently lost its opening `<a` tag, and the
+compiler reported the error several lines away from the actual problem. Worth
+trusting this pattern going forward: if a build error mentions `Unexpected
+token` on a line that looks completely normal, check nearby `href=`/attribute
+lines for a tag missing its name — `grep -n 'href='` is a fast way to scan for
+it before even opening the browser.
+
+---
+
+# Learning log — Day 5
+
+## 16. Embeddings & vector space intuition
+
+**Core idea:** an embedding turns text into a list of numbers — a point in
+space — positioned so that text with *similar meaning* ends up nearby, even if
+the wording shares no words at all ("debugged a flaky test" and "the CI
+pipeline caught a bug" land close together despite minimal word overlap).
+
+**Why this matters for RAG:** a user's question gets embedded into a point in
+this same space, and the system finds whichever stored chunks are *nearest* —
+retrieval by meaning, not keyword matching.
+
+## 17. Prompt engineering basics
+
+A good system prompt generally has three parts:
+- **Role** — who/what the model is acting as ("you're answering questions
+  about Fang's resume")
+- **Boundaries** — what to do when a question falls outside scope (politely
+  decline and redirect, rather than answering anyway or refusing rudely)
+- **Format guidance** — length/tone defaults ("2-4 sentences unless asked for
+  more detail")
+
+## 18. Chunking strategy and content organization
+
+**Goal:** group content by *topic coherence*, so a single retrieved chunk
+answers one kind of question well rather than being a grab-bag of loosely
+related facts.
+
+**Naming discipline for chunk IDs:** name each chunk after its *purpose*
+(what kind of question it answers), not just its literal contents — e.g.
+`internship_experience` rather than `dyson_panasonic`. The ID is never shown
+to a user, but a purpose-driven name makes the content file maintainable later.
+
+**A genuine judgment call worth remembering:** overlapping categories (e.g.
+scholarships could reasonably live under "education" or "awards") are best
+resolved by asking which *kind of question* each item answers — splitting
+pure academic facts from recognition/awards kept both more retrievable.
+
+## 19. Chroma as an embedded vector database
+
+Chroma isn't a server your app calls over a network — for a project this
+size, it's a library that runs *inside* your own Python process and writes to
+a local folder (`chroma_db/`), conceptually similar to SQLite. It never talks
+to Gemini directly; your own code is the middleman both ways.
+
+## 20. How Chroma, Gemini, and your code fit together
+
+```
+Ingest:  your code → Gemini (embed each chunk) → Chroma (store vector + text)
+Query:   your code → Gemini (embed the question) → Chroma (find nearest vectors)
+         → Chroma returns matching TEXT → your code → Gemini again (LLM call,
+         this time to write an answer using that text as context)
+```
+
+## 21. Industrial practices for vector search
+
+- **Same embedding model for ingest and query, always** — mixing models
+  breaks similarity search, since "nearness" only means something within one
+  model's own space.
+- **Asymmetric task types** — `task_type="retrieval_document"` at ingest vs.
+  `"retrieval_query"` at query time; good embedding APIs optimize these
+  differently since a question and its answer don't look alike as raw text.
+- **Metadata filtering** — attaching category/date metadata to chunks so you
+  can narrow the candidate set before doing similarity search, useful once
+  content grows large.
+
+## 22. Why local persistence doesn't survive Cloud Run
+
+Cloud Run's disk is like a rented hotel room, not an owned apartment — every
+container start (redeploy, scale-up, automatic restart) gets a **brand-new,
+empty filesystem**. A `PersistentClient` writing to a local folder works
+perfectly on a laptop (whose disk genuinely persists) but loses everything the
+moment the same code runs inside Cloud Run. Flagged as a known gap to solve
+before this matters for real deployment, not fixed yet.
+
+## 23. Gemini's two distinct roles
+
+The same "Gemini" umbrella covers two functionally separate models used for
+two different jobs in this project:
+- **Embedding model** (e.g. `gemini-embedding-001`) — turns text into a vector.
+  Used twice: once per chunk at ingest, once per question at query time.
+- **Chat/LLM model** (e.g. `gemini-flash-latest`) — takes retrieved text plus
+  a question and writes an actual natural-language answer. Chroma never
+  produces formatted answers itself — it only ever returns raw stored text.
+
+## 24. Model deprecation and verifying against current docs
+
+`models/text-embedding-004` — the model name originally used — turned out to
+already be deprecated by Google. AI tooling/model names move fast enough that
+even confident-sounding instructions can be stale; checking current official
+docs before trusting a specific model/API name is a real, recurring
+discipline, not a one-off fluke.
+
+## 25. Two separate Google billing systems
+
+**Google Cloud Billing** (the GCP trial credit used for Cloud Run/Build) and
+**Gemini API / AI Studio billing** are entirely separate ledgers — funding one
+does not affect the other. A specific error ("prepayment credits are
+depleted") turned out to be a known, currently-reported Google-side bug tied
+to projects with an active GCP trial specifically; switching to a plain
+"Free tier" API key (no GCP trial attached) sidestepped it entirely.
+
+**Related, separate issue also hit this day:** even a working key can have
+per-model free-tier quota set to `0` for a specific model version, independent
+of overall account status. `genai.list_models()` reveals which models a key
+can call *at all*, but not which currently have non-zero free quota — the
+`-latest` aliases (e.g. `gemini-flash-latest`) are a more durable choice than
+pinning an exact version number, since Google keeps them pointed at whichever
+model currently sits in the free tier.
+
+## RAG pipeline, end to end (recap)
+
+```
+INGEST     resume content → chunked by topic → embedded → stored in Chroma
+RETRIEVE   user question → embedded → Chroma finds nearest chunks
+AUGMENT    system prompt + retrieved chunks + question, combined
+GENERATE   combined prompt → LLM → grounded natural-language answer
+SERVE      wrapped behind a FastAPI endpoint
+DEPLOY     same GitHub Actions → Cloud Run pipeline as the rest of the backend
+```
+Day 5 covered Ingest and half of Retrieve. Day 6 covered Augment, Generate,
+and Serve.
+
+---
+
+# Learning log — Day 6
+
+## 26. From script to reusable function
+
+A script (`query_test.py`) runs top-to-bottom and prints output when executed
+directly — nothing happens just from importing it. A FastAPI endpoint needs
+something it can *call and get a return value from*, so the same retrieval
+logic was extracted into a plain function (`get_relevant_chunks` in
+`retrieve.py`) that both the test script and the real endpoint can share,
+without duplicating logic.
+
+## 27. System prompt as a versioned file
+
+The system prompt lives in its own file (`app/prompts/ask_me_system.md`)
+rather than being a string buried inside Python — the "skill file" pattern
+from the original proposal. This keeps prompt content editable and
+version-controlled independently from application logic.
+
+## 28. Assembling retrieval + prompt + generation
+
+`chat.py` ties the pieces together: retrieve relevant chunks → join them into
+one string with blank-line separators (`"\n\n".join(chunks)`, which signals to
+the LLM that these are distinct excerpts rather than one continuous passage,
+reducing the chance it blends facts that were never actually adjacent) → send
+that combined context plus the question to the chat model.
+
+## 29. FastAPI route conventions
+
+```python
+@app.post("/api/chat")          # decorator: HTTP method + URL path
+def chat(request: ChatRequest):  # function FastAPI calls for that route
+    ...
+    return {"answer": answer}    # auto-converted to JSON
+```
+FastAPI's value over handling raw HTTP by hand: automatic request validation,
+automatic JSON conversion, and free interactive docs at `/docs`.
+
+## 30. Pydantic request validation
+
+`class ChatRequest(BaseModel): message: str` *is* input validation — if a
+request is missing `message` or sends the wrong type, FastAPI rejects it
+automatically (422 error) before the endpoint function even runs. Deeper
+validation (length limits, content checks) is a separate, not-yet-added layer.
+
+## 31. Uvicorn — the ASGI server
+
+FastAPI describes *what* endpoints do; Uvicorn is the program that actually
+listens on a network port, accepts connections, and hands each request to
+FastAPI. FastAPI without a server like Uvicorn is inert code that never
+receives anything.
+
+## 32. HTTP vs. framework — untangling the relationship
+
+HTTP is the *protocol* (the rules requests/responses follow). FastAPI is one
+*tool*, written in Python, for building a server that speaks that protocol —
+Flask, Django, and Express are other tools that speak the same protocol
+differently. `curl` talks HTTP to whatever is listening on a port; it has no
+awareness of which framework is on the other end.
+
+## 33. Backend directory structure
+
+```
+backend/app/
+├── main.py              — FastAPI app + all route definitions
+├── data/resume_chunks.py — raw content to ingest
+├── prompts/ask_me_system.md — system prompt text
+└── rag/
+    ├── ingest.py         — one-time: embeds chunks, writes to Chroma
+    ├── retrieve.py        — reusable: question → relevant chunks
+    ├── chat.py             — reusable: question → full answer
+    └── query_test.py       — manual test script, not used by the real app
+```
+Each file has one job; `main.py` → `chat.py` → `retrieve.py` → `chroma_db/`
+is the only real dependency chain.
+
+## 34. Why generated data isn't committed
+
+`chroma_db/` is *output*, not source — reproducible any time by re-running
+`ingest.py`, and not meaningful to review in a diff (a vector is a wall of
+floating-point numbers). Same category of exclusion as `node_modules/` or a
+compiled build folder: commit the recipe, not the result of running it.
+
+## 35. Error handling pattern
+
+Convention: keep low-level functions (`get_relevant_chunks`, `answer_question`)
+simple and let exceptions propagate; catch and translate errors at the
+*endpoint* layer, where there's a clear boundary to a public response.
+Catching a specific exception type (`ResourceExhausted` for Gemini rate
+limits) allows a specific, honest message; a broader `except Exception`
+catches anything else with a generic, safe message — a visitor should never
+see a raw Python traceback, which would leak internal file paths and library
+details. The real error still gets logged server-side (`logger.exception`)
+for actual debugging.
+
+## 36. Agent vs. fixed pipeline — what was actually built
+
+**A fixed pipeline** (what exists now): retrieval runs unconditionally on
+every question, in a hardcoded sequence — the LLM never decides *whether* to
+look something up.
+
+**A true agent** (industry sense, not yet built): the LLM itself decides which
+tool(s) to call, if any, based on reasoning about the specific question — a
+capability called **function calling / tool use**. Planned for a later day,
+once multiple tools exist for the model to choose between.
+
+## 37. Prompt engineering calibration — where and when
+
+- **System prompt changes** (identity, boundaries, tone): rare, deliberate,
+  durable behavior — not tuned per-question.
+- **Formatting/output instructions**: iterated more often, based on observed
+  failures.
+- **Key discipline**: diagnose *which layer* actually failed (retrieval,
+  generation, or prompt) before changing anything — prompt tweaks cannot fix
+  a wrong answer caused by retrieving the wrong chunk in the first place.
+
+## 38. Production QA controls for an agentic/RAG system
+
+- **Golden eval sets** — fixed question → expected-behavior pairs, re-run
+  automatically on every change (planned Day 8; the manual off-topic test
+  done today is exactly the kind of case that belongs in that permanent set).
+- **Groundedness/faithfulness checks** — verifying an answer doesn't contain
+  claims absent from the retrieved context.
+- **Boundary/adversarial regression tests** — off-topic refusal, prompt-
+  injection attempts ("ignore previous instructions...").
+- **Observability** — token usage, latency, error-rate logging per request.
+- **Graceful degradation** — known failure modes get specific, calm
+  responses rather than generic crashes (implemented today for rate limits).
+- **Prompt version control** — treating system prompt edits like code changes,
+  reviewed and revertible, not edited live in production.
+
+
+---
+
+# Learning log — Day 5 & Day 6: building the RAG chat agent
+
+## 16. Embeddings — the core intuition
+
+An embedding turns a sentence into a list of numbers (a point in a high-dimensional
+space) such that sentences with similar *meaning* land near each other — not
+similar spelling. "I debugged a flaky test" and "the CI pipeline caught a bug"
+end up close together despite sharing almost no words. This is the whole
+mechanism retrieval relies on: a user's question gets embedded into that same
+space, and whichever stored chunks are *nearest* to it are the relevant ones.
+
+## 17. Prompt engineering — the three-part shape of a system prompt
+
+A good system prompt generally has: **role** ("you're answering questions about
+X"), **boundaries** ("if off-topic, decline politely"), and **format guidance**
+("keep answers to 2-3 sentences unless asked for more"). Built for real in
+`app/prompts/ask_me_system.md` and confirmed working via the off-topic test at
+the end of Day 6.
+
+## 18. Content chunking — grouping principle and naming
+
+**Chunking principle:** group by topic coherence, not by arbitrary size — the
+goal is that a retrieved chunk is about *one thing*, so the LLM isn't stitching
+together loosely related facts from a grab-bag.
+
+**Chunk ID naming, corrected mid-session:** IDs are internal-only (never shown
+to a user) but should describe the chunk's *purpose*, not just what happens to
+be in it. `dyson_panasonic` (names the companies) was renamed in spirit to
+`internship_experience` (names the category) — the second tells you the chunk's
+role at a glance, which matters when maintaining the file later.
+
+**Category judgment call, made explicit:** pure academic facts (degree,
+university, honours) belong in `education`; recognition (scholarships, the
+TikTok Spot Bonus) belongs in a separate `awards` chunk — because "where did she
+study" and "what awards has she won" are different question types, and mixing
+them means either question retrieves irrelevant content alongside the right answer.
+A content *error* was also caught and fixed in this pass: the TikTok bonus had
+been miscategorized under education originally.
+
+## 19. Chroma — what it actually is and how it fits the codebase
+
+Chroma is not a separate server the app calls over a network — for a project
+this size, it's a Python library running *inside* the same process, writing to
+a local folder (`chroma_db/`), conceptually similar to SQLite. Chroma and Gemini
+never talk to each other directly; the app's own code is the middleman for both:
+
+- **Ingest time:** app code → Gemini (embed each chunk) → Chroma (store vector + text)
+- **Query time:** app code → Gemini (embed the question) → Chroma (find nearest
+  vectors, return matching text) → app code → Gemini again (this time as an LLM,
+  to write a natural-language answer using that text)
+
+**Industrial practices noted:**
+- Always use the *same* embedding model for ingest and query — mixing models
+  breaks similarity search, since "nearness" only means something within one
+  model's space.
+- Asymmetric task types: `task_type="retrieval_document"` at ingest,
+  `task_type="retrieval_query"` at query time — good embedding APIs optimize
+  these differently since a question and its answer don't look alike as raw text.
+- Metadata filtering (attaching category/date to chunks, filtering before
+  similarity search) becomes relevant once the data source grows large — not
+  needed yet at 9 chunks.
+
+## 20. Why local persistence doesn't survive Cloud Run
+
+Cloud Run gives each container a fresh, empty filesystem on every start,
+restart, or scale-up — like a hotel room, not an owned apartment. Nothing
+written to disk in a previous run carries over. `PersistentClient`'s local
+folder works fine on a laptop (which genuinely persists between runs) but would
+silently lose all ingested data the moment this code runs in Cloud Run. **Flagged
+as a known gap to fix on a later day** (options noted: re-run ingestion at
+container startup, or move Chroma's storage to a mounted volume/cloud bucket) —
+not yet resolved.
+
+## 21. Two separate Gemini roles, not one
+
+- **Gemini as an embedding model** (`embed_content`) — turns text into a vector.
+  Used twice: once at ingest, once per query.
+- **Gemini as an LLM/chat model** (`GenerativeModel(...).generate_content(...)`)
+  — a *different* model, takes retrieved text + the question, writes an actual
+  answer. Chroma never does this formatting step itself; it only ever returns
+  raw stored text.
+
+## 22. RAG end-to-end, the full pipeline
+
+```
+INGEST (one-time, or when content changes)
+  content → split into topic chunks → embed each → store in vector DB
+
+RETRIEVE (every user question)
+  question → embed it → vector DB finds nearest chunks
+
+AUGMENT
+  system prompt + retrieved chunks + question → combined prompt
+
+GENERATE
+  combined prompt → LLM → grounded answer
+
+SERVE
+  wrapped behind a FastAPI endpoint (POST /api/chat)
+
+DEPLOY
+  same GitHub Actions → Cloud Run pipeline as the rest of the backend
+```
+Day 5 covered Ingest and Retrieve; Day 6 covered Augment, Generate, and Serve.
+
+## 23. Backend directory structure
+
+```
+backend/
+├── app/
+│   ├── main.py              — FastAPI app + all route definitions
+│   ├── data/resume_chunks.py — raw content to ingest
+│   ├── prompts/ask_me_system.md — system prompt text
+│   └── rag/
+│       ├── ingest.py        — one-time script: embed chunks → Chroma
+│       ├── retrieve.py      — reusable function: question → relevant chunks
+│       ├── chat.py          — reusable function: question → full answer
+│       └── query_test.py    — throwaway manual test script
+├── chroma_db/                 — generated vector data (gitignored)
+├── requirements.txt
+├── Dockerfile
+└── .env                        — secrets (gitignored)
+```
+Flow: `main.py` → `chat.answer_question()` → `retrieve.get_relevant_chunks()` →
+reads `chroma_db/` (populated earlier by `ingest.py`). Each file has one job.
+
+## 24. Script vs. reusable function — what makes something endpoint-callable
+
+Nothing magic distinguishes them structurally — it's about shape. `query_test.py`
+is a script: runs top-to-bottom, prints to console, does nothing on import.
+`retrieve.py` defines a *function* (`get_relevant_chunks`) that does nothing on
+its own but returns a value when called — which is what an endpoint needs. The
+same underlying logic was extracted from the throwaway script into a proper
+function specifically so both the test script and the real endpoint could reuse
+it without duplication.
+
+## 25. Which endpoints call retrieval, and why just one
+
+Only `/api/chat` calls `get_relevant_chunks()` — as an internal implementation
+detail, never exposed to visitors directly. Retrieval isn't a standalone public
+capability; it's a helper step inside answering a question. A separate feature
+needing search later could reuse the same function without new retrieval logic.
+
+## 26. Error handling convention — where it lives
+
+**Low-level functions stay simple and let exceptions propagate.** The *endpoint*
+is where errors get caught and translated into a sensible HTTP response — a
+visitor should see "something went wrong, try again," never a raw Python
+traceback. Implemented for real at the end of Day 6:
+- Catch the *specific* exception type where possible (`ResourceExhausted` for
+  Gemini rate limits) → return an honest, specific message ("busy, try again").
+- Catch generic `Exception` as a safety net for anything else → return a vague,
+  safe message (prevents leaking internal file paths/library details).
+- Log the *real* error server-side (`logger.warning` / `logger.exception`) even
+  while showing the visitor something generic — debuggability without exposure.
+- A generic `500 Internal Server Error` is just FastAPI/Uvicorn's fallback for
+  *any* uncaught exception — it's a wrapper, not a diagnosis; the real cause is
+  always underneath it in the traceback.
+
+## 27. Prompt assembly — what `"\n\n".join(chunks)` does and why
+
+`chunks` is a list of separate strings; `"\n\n".join(...)` glues them into one
+string with a blank line between each. The blank lines are a cheap, effective
+signal to the LLM that these are *separate, distinct excerpts* rather than one
+continuous paragraph — run-on text with no separation makes it more likely the
+model blends facts that were never actually adjacent in the source content.
+Retrieved chunks being handed to the LLM as labeled "context" alongside the
+question is the standard, textbook shape of RAG — not a project-specific choice.
+
+## 28. FastAPI conventions
+
+```python
+@app.get("/some-path")      # decorator: HTTP method + URL path
+def function_name():         # called by FastAPI when that URL is hit
+    return {"key": "value"}  # auto-converted to JSON
+```
+FastAPI's value over handling raw HTTP by hand: automatic request validation via
+Pydantic models (e.g. `class ChatRequest(BaseModel): message: str` — a request
+missing or misdefining `message` gets auto-rejected with a 422 before the
+function even runs), automatic JSON conversion both directions, and free
+interactive docs at `/docs`.
+
+**Framing correction made explicit:** FastAPI is not an alternative to HTTP —
+it *is* HTTP, just a Python framework that makes writing HTTP endpoints far
+less tedious than handling raw sockets. `curl` speaks HTTP to whatever's
+listening on a port; it has no awareness of which framework (FastAPI, Flask,
+Express) is on the other end.
+
+## 29. What Uvicorn is, and why it's separate from FastAPI
+
+FastAPI describes *what* endpoints do; something still has to actually listen
+on a network port and hand incoming connections to FastAPI. That's Uvicorn's
+job — an ASGI server. FastAPI without a server like Uvicorn running it is inert
+code that never receives a request.
+
+## 30. Debugging model-availability errors — a repeatable pattern
+
+Hit twice in one session, each with a different root cause, both real "AI
+tooling moves fast" lessons:
+
+- **`text-embedding-004` not found** → the model had been deprecated by Google
+  since the original instructions were written. Fixed by switching to
+  `gemini-embedding-001`.
+- **A typo'd fix** (`text-embedding-001`, which nobody typed intentionally)
+  appeared after an editor edit — fixed by verifying the literal file content
+  via `grep` rather than trusting the edit happened as described, then
+  correcting via a `sed` command run directly in the terminal to avoid further
+  editor-autocomplete interference.
+- **`gemini-2.0-flash` quota limit: 0`** despite appearing in
+  `list_models()` output — the key lesson: **being listed as a permitted model
+  and having non-zero free-tier quota are two separate gates.** `list_models()`
+  only confirms the first. Fixed by switching to a `-latest` alias
+  (`gemini-flash-latest`) rather than a specific version number, since Google
+  maintains these aliases to always point at whatever they currently consider
+  the free-tier-appropriate model — a more durable choice than hardcoding a
+  version that could get its quota reallocated the same way.
+
+**General pattern worth keeping:** when an AI provider's model name fails,
+verify against the provider's *current* live behavior (search, or a
+`list_models()`-style call) rather than trusting either party's static
+knowledge — both a person's instructions and a model's training data can be
+stale relative to how fast these APIs change.
+
+## 31. Gemini billing — two separate systems, and a known Google-side bug
+
+**Google Cloud Billing** (the GCP trial credit) and **Gemini API / AI Studio
+billing** are entirely separate systems — a GCP trial credit does not fund
+Gemini API usage at all, and vice versa. This explains why the resume agent's
+LLM calls run under a *different* Google project than the Cloud Run
+infrastructure — a real, acknowledged bit of tangle in the setup, not
+tidy, but functional and free.
+
+**The specific error hit** ("prepayment credits are depleted" on a fresh
+free-tier key) was confirmed, via checking current forum reports, to be a
+**known, currently-open Google-side billing-state sync bug** affecting projects
+with an active GCP trial specifically — not something caused locally, and not
+reliably fixed by enabling billing (multiple reports showed the error
+persisting even with billing already active). **Resolution used:** switch to a
+different, older API key/project with no GCP trial attached, which sidesteps
+the buggy trial-tier ledger entirely.
+
+**Cosmetic, unrelated noise:** the "Failed to send telemetry event" messages
+seen throughout are Chroma's own optional, anonymous analytics call failing due
+to a harmless version mismatch — confirmed not to affect ingestion or retrieval
+correctness in any way, safe to ignore or silence via
+`os.environ["ANONYMIZED_TELEMETRY"] = "False"`.
+
+## 32. Agent vs. fixed pipeline — a real distinction, not just terminology
+
+What's built as of Day 6 is more precisely a **grounded chatbot / fixed RAG
+pipeline**, not yet a full **agent** in the stricter industrial sense — worth
+naming the distinction rather than blurring it:
+
+- **What we have:** retrieval runs *unconditionally* on every question,
+  hardcoded in `chat.py`. The LLM never decides whether to look something up —
+  that decision was made in code, not by the model.
+- **What a true agent adds:** the LLM itself decides *whether* and *which*
+  tool(s) to call, based on reasoning about the specific question — this
+  capability is called **function calling** / **tool use**. E.g., a real agent
+  version would offer multiple tools (`search_resume`, `get_project_details`,
+  `get_fun_fact`) and let the model choose among them, potentially calling
+  several in sequence.
+- System prompt for identity/scope: correctly part of "agent" thinking either
+  way. Autonomous, LLM-decided tool invocation: not yet implemented — this is
+  the explicit target of a later day (multi-tool agent work), not something
+  accidentally skipped.
+
+## 33. Where prompt engineering calibration happens, and the guiding principle
+
+- **System prompt changes** (identity, boundaries, tone): rare and deliberate —
+  durable behavior, not tuned per-question.
+- **Formatting/output instructions**: iterated more frequently, based on
+  observed failures (e.g. answers too long → add a length instruction → re-test
+  to confirm nothing else broke).
+- **General principle:** treat prompt changes like any regression-tested
+  system change — alter one variable, re-run the same fixed test set, compare
+  results, rather than tuning by feel.
+- **Trap to avoid:** using prompt tweaks to paper over a *retrieval* failure.
+  If a wrong answer traces back to the wrong chunk being retrieved, no prompt
+  wording fixes that — the fix belongs in chunking/retrieval, not the prompt.
+  Diagnosing *which layer* actually failed (retrieval vs. generation vs.
+  prompt) before changing anything is the real skill, and directly motivates
+  building a fixed eval set later (a later day) rather than tuning ad hoc.
+
+## 34. Common production QA controls for an agentic/RAG flow
+
+- **Golden eval sets** — a fixed list of question → expected-behavior pairs,
+  run automatically on every prompt or code change (planned for a later day;
+  the manual off-topic test just performed is exactly the kind of case that
+  belongs permanently in such a set).
+- **Groundedness/faithfulness checks** — verifying an answer doesn't contain
+  claims absent from the retrieved context (often done via a second LLM call
+  grading the first's output against its source context).
+- **Boundary/adversarial regression tests** — off-topic refusal (tested today,
+  passed) and prompt-injection resistance ("ignore previous instructions...")
+  — should become permanent automated tests, not one-off manual checks.
+- **Observability** — token usage, latency, and error-rate logging per request
+  (planned: Langfuse, later day) — catches quality or cost regressions before a
+  user reports them.
+- **Graceful degradation** — implemented today: known failure modes (rate
+  limits) get a specific, honest response rather than a generic crash.
+- **Prompt version control** — the system prompt already lives in its own
+  file, tracked like code, rather than edited live in a running system.
