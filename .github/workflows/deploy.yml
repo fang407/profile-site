@@ -34,7 +34,8 @@ jobs:
             --source ./backend \
             --region us-central1 \
             --project ${{ secrets.GCP_PROJECT_ID }} \
-            --allow-unauthenticated
+            --allow-unauthenticated \
+            --set-env-vars GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
 
       - name: Deploy frontend
         run: |
