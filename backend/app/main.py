@@ -1,7 +1,10 @@
 import logging
 from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from app.rag.chat import answer_question
+from app.rag.retrieve import collection
+from app.rag.ingest import main as run_ingestion
 from google.api_core.exceptions import ResourceExhausted
 
 logger = logging.getLogger("uvicorn.error")
@@ -9,7 +12,14 @@ logger = logging.getLogger("uvicorn.error")
 class ChatRequest(BaseModel):
     message: str
 
-app = FastAPI(title="profile-site-backend")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if collection.count() == 0:
+        print("Chroma collection empty — running ingestion on startup")
+        run_ingestion()
+    yield
+
+app = FastAPI(title="profile-site-backend", lifespan=lifespan)
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
